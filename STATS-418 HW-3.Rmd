@@ -1,0 +1,255 @@
+---
+title: "STATS-418 HW-3"
+author: "Yuan Song (204877123)"
+date: "May 24, 2017"
+output: html_document
+---
+# Dataset Introduction
+The Adult Census Income Binary Classification dataset I am going to use is publicly available at the UCI Machine Learning Repository. This data derives from census data, and consists of information about 48842 individuals and their annual income. The predict variable is that if an individual earns >50k a year or <=50K a year, and I set >50K as 1, <=50K as 0.
+
+In the following, I will use various algorithms (LR, RF, GBM) with various implementations (R packages, h2o), and use various values for the hyperparameters (tuning).
+```{r}
+library(gbm)
+library(h2o)
+library(ggplot2)
+library(dplyr)
+library(readxl)
+library(glmnet)
+library(MASS)
+library(randomForest)
+library(ROCR)
+library(xgboost)
+
+testdata <- read.table("https://archive.ics.uci.edu/ml/machine-learning-databases/adult/adult.data", sep = ",", col.names = c("age", "workclass", "fnlwgt", "education", "education-num", "marital-status", "occupation", "relationship", "race", "sex", "capital-gain", "capital-loss", "hours-per-week", "native-country", "earnings"))
+data <- read.table("https://archive.ics.uci.edu/ml/machine-learning-databases/adult/adult.data", sep = ",", col.names = c("age", "workclass", "fnlwgt", "education", "education-num", "marital-status", "occupation", "relationship", "race", "sex", "capital-gain", "capital-loss", "hours-per-week", "native-country", "earnings"))
+
+d <- rbind(testdata, data)
+Y<-as.factor(d$Y)
+d$Y[d$earnings == " <=50K"] <- 0
+d$Y[d$earnings == " >50K"] <- 1
+d[[15]]<-NULL
+```
+
+# Split of train, validation and test set
+```{r}
+set.seed(123)
+idx <- sample(seq(1, 3), size = nrow(d), replace = TRUE, prob = c(.6, .2, .2))
+d_train <- d[idx == 1,]
+d_validation <- d[idx == 2,]
+d_test <- d[idx == 3,]
+
+X <- Matrix::sparse.model.matrix(Y ~ . -1, data = d)
+X_train <- X[idx == 1,]
+X_validation <- X[idx == 2,]
+X_test <- X[idx == 3,]
+
+# h2o
+h2o.init(nthreads=-1)
+
+dx <- as.h2o(d)
+dx_split <- h2o.splitFrame(dx, ratios = c(0.6,0.2), seed = 123)
+dx_train <- dx_split[[1]]
+dx_validation <- dx_split[[2]]
+dx_test <- dx_split[[3]]
+
+Xnames <- names(dx_train)[which(names(dx_train)!="Y")]
+
+# xgboost
+dxgb_train <- xgb.DMatrix(data = X_train, label = ifelse(d_train$Y=='1',1,0))
+n_proc <- parallel::detectCores()
+
+```
+
+# Logistic Regression (Lasso)
+## R package: glmnet
+```{r}
+# 1. Lambda = 0 (no regularization)
+md1 <- glmnet( X_train, d_train$Y, family = "binomial", lambda = 0)
+phat <- predict(md1, newx = X_validation, type = "response")
+# AUC
+rocr_pred <- prediction(phat, d_validation$Y)
+performance(rocr_pred, "auc")@y.values[[1]]
+# ROC curve
+plot(performance(rocr_pred, "tpr", "fpr"),
+     main= "ROC Curve of Validation Dataset without Regularization")
+```
+
+```{r}
+# 2.Lambda = 0.05
+md2 <- glmnet( X_train, d_train$Y, family = "binomial", lambda = 0.05, intercept = FALSE)
+phat <- predict(md2, newx = X_validation, type = "response")
+# AUC
+rocr_pred <- prediction(phat, d_validation$Y)
+performance(rocr_pred, "auc")@y.values[[1]]
+```
+
+```{r}
+# 3. Best Lambda
+md3 <- cv.glmnet( X_train, d_train$Y, family = "binomial", intercept = FALSE,type.measure="auc")
+bestlambda <- md3$lambda.min
+bestlambda
+phat <- predict(md3, newx = X_validation, type = "response")
+# AUC
+rocr_pred <- prediction(phat, d_validation$Y)
+performance(rocr_pred, "auc")@y.values[[1]]
+# ROC curve
+
+plot(performance(rocr_pred, "tpr", "fpr"), 
+     main= "ROC Curve of Validation Dataset with Best Lambda")
+```
+
+## h2o
+```{r}
+# 1. Lambda = 0 (no regularization)
+md4 <- h2o.glm(x = Xnames, y = "Y", training_frame = dx_train, 
+                family = "binomial", alpha = 1, lambda = 0)
+h2o.auc(h2o.performance(md4, dx_validation))
+```
+
+```{r}
+# 2. Lambda = 0.05
+md5 <- h2o.glm(x = Xnames, y = "Y", training_frame = dx_train, 
+                family = "binomial", alpha = 1, lambda = 0.05, intercept = FALSE)
+h2o.auc(h2o.performance(md5, dx_validation))
+```
+
+```{r}
+# 3. Best Lambda
+md6 <- h2o.glm(x = Xnames, y = "Y", training_frame = dx_train, 
+                family = "binomial", alpha = 1, lambda=bestlambda)
+h2o.auc(h2o.performance(md6, dx_validation))
+```
+In this part, I use the logistic regression (Lasso regularization) with various parameter of lambda. The regularization parameter lambda is a control on the fitting parameters. As the fitting parameters increase, there will be an increasing penalty on the function. 
+
+First, I started with r package glmnet. I set lambda = 0, which is same as non-regularized linear regression. Then I tried lambda = 0.05 with regularization, and found the AUC is lower than without regularization. Finally, I used cross-validation to get the best lambda.The best lambda is 0.0001387086. As it's AUC is very close to 1, it means this model fits well. However, it doesn't necessarily to have the highest AUC.
+
+Second, I did the logistic regression in h2o, and get the AUC of without regularization,
+with regularization, and using the best lambda. In this case, the best lambda gives the highest AUC, which means it fits data very well.
+
+I ploted the ROC curve to show the true positive rate vs the false positive rate. The AUC is the area beneath the ROC curve. The closer AUC for a model comes to 1, the better it is. So models with higher AUCs are preferred over those with lower AUCs. When the false positive rate increases, the true positive rate also increases. According to the ROC curve plots, we can tell the AUCs are all near perfect predictions on the validation dataset. 
+
+# Random Forest
+## R package: randomForest
+```{r}
+set.seed(123)
+rf1 <- randomForest(as.factor(Y) ~ ., data = d_train, ntree = 100, max_depth = 20)
+rf1phat<- predict(rf1, d_validation, type = "prob")[,"1"]
+rf1rocr_pred <- prediction(rf1phat, d_validation$Y)
+performance(rf1rocr_pred, "auc")@y.values[[1]]
+
+rf2 <- randomForest(as.factor(Y) ~ ., data = d_train, ntree = 120, max_depth = 20)
+rf2phat<- predict(rf2, d_validation, type = "prob")[,"1"]
+rf2rocr_pred <- prediction(rf2phat, d_validation$Y)
+performance(rf2rocr_pred, "auc")@y.values[[1]]
+
+rf3 <- randomForest(as.factor(Y) ~ ., data = d_train, ntrees = 120, max_depth = 20, mtries=2)
+rf3phat<- predict(rf3, d_validation, type = "prob")[,"1"]
+rf3rocr_pred <- prediction(rf3phat, d_validation$Y)
+performance(rf3rocr_pred, "auc")@y.values[[1]]
+
+rf4 <- randomForest(as.factor(Y) ~ ., data = d_train, ntrees = 120, max_depth = 20, mtries=5)
+rf4phat<- predict(rf4, d_validation, type = "prob")[,"1"]
+rf4rocr_pred <- prediction(rf4phat, d_validation$Y)
+performance(rf4rocr_pred, "auc")@y.values[[1]]
+
+plot(rf4)
+```
+
+## xgboost
+```{r}
+n_proc <- parallel::detectCores()
+rf5 <- xgboost(data = X_train, label = ifelse(d_train$Y=='1',1,0),
+                 nthread = n_proc, nround = 1, max_depth = 20,
+                 num_parallel_tree = 100, subsample = 0.632,
+                 colsample_bytree = 1/sqrt(length(X_train@x)/nrow(X_train)),
+                 save_period = NULL)
+phat <- predict(rf5, newdata = X_validation)
+rocr_pred <- prediction(phat, d_validation$Y)
+performance(rocr_pred, "auc")@y.values[[1]]
+
+rf6 <-xgboost(data = X_train, label = ifelse(d_train$Y=='1',1,0),
+                 nthread = n_proc, nround = 1, max_depth = 20,
+                 num_parallel_tree = 200, subsample = 0.632,
+                 colsample_bytree = 1/sqrt(length(X_train@x)/nrow(X_train)),
+                 save_period = NULL)
+phat <- predict(rf6, newdata = X_validation)
+rocr_pred <- prediction(phat, d_validation$Y)
+performance(rocr_pred, "auc")@y.values[[1]]
+
+rf7 <-xgboost(data = X_train, label = ifelse(d_train$Y=='1',1,0),
+                 nthread = n_proc, nround = 1, max_depth = 20,mtries=2,
+                 num_parallel_tree = 200, subsample = 0.632,
+                 colsample_bytree = 1/sqrt(length(X_train@x)/nrow(X_train)),
+                 save_period = NULL)
+phat <- predict(rf7, newdata = X_validation)
+rocr_pred <- prediction(phat, d_validation$Y)
+performance(rocr_pred, "auc")@y.values[[1]]
+
+```
+I then use the model of Random Forest.I tried various numbers of trees, tune the depth of the trees and the parameter governing the number of columns used in each split. Finally, we can see the best model is rf4 with 120 trees, a maximum tree depth of 20, and 5 columns used in each split.It gives the highest AUC, which is 0.9495126. We can make a prelimanary guess that the more trees in the forest, the better the fit. Also, it would be better to grow very large trees, so the maximum levels should be set large and the minimum node size control would limit the size of the trees.
+
+# GBM
+## R package: gbm
+```{r}
+set.seed(123)
+
+md1 <- gbm(Y ~ ., data = d_train, distribution = "bernoulli",
+          n.trees = 100, interaction.depth = 10, shrinkage = 0.01)
+gbm.perf(md1, plot.it = TRUE)
+yhat <- predict(md1, d_test, n.trees = 100) 
+GBM_pred <- prediction(yhat, d_test$Y)
+performance(GBM_pred, "auc")@y.values[[1]]
+
+md2 <- gbm(Y ~ ., data = d_train, distribution = "bernoulli",
+          n.trees = 100, interaction.depth = 10, shrinkage = 0.01, cv.folds = 5)
+gbm.perf(md2, plot.it = TRUE)
+yhat <- predict(md2, d_test, n.trees = 100) 
+GBM_pred <- prediction(yhat, d_test$Y)
+performance(GBM_pred, "auc")@y.values[[1]]
+
+md3 <- gbm(Y ~ ., data = d_train, distribution = "bernoulli",
+          n.trees = 100, interaction.depth = 10, shrinkage = 0.3, cv.folds = 5)
+gbm.perf(md3, plot.it = TRUE)
+yhat <- predict(md3, d_test, n.trees = gbm.perf(md, plot.it = FALSE))
+GBM_pred <- prediction(yhat, d_test$Y)
+performance(GBM_pred, "auc")@y.values[[1]]
+```
+
+## Xgboost
+```{r}
+# without early stop
+xgb1 <- xgb.train(data = dxgb_train, nthread = n_proc, objective = "binary:logistic", 
+                  nround = 200, max_depth = 20, eta = 0.1)
+
+phat <- predict(xgb1, newdata = X_validation)
+
+rocr_pred <- prediction(phat, d_validation$Y)
+performance(rocr_pred, "auc")@y.values[[1]]
+
+xgb2 <- xgb.train(data = dxgb_train, nthread = n_proc, objective = "binary:logistic", 
+                    nround = 200, max_depth = 10, eta = 0.1)
+phat <- predict(xgb2, newdata = X_validation)
+rocr_pred <- prediction(phat, d_validation$Y)
+performance(rocr_pred, "auc")@y.values[[1]] 
+
+# with early stop
+xgb3 <- xgb.train(data = dxgb_train, nthread = n_proc, objective = "binary:logistic", 
+                    nround = 200, max_depth = 10, eta = 0.1,
+                   ntrees = 200, learn_rate = 0.1, stopping_rounds=5,
+                  stopping_tolerance = 0.0001, stopping_metric="AUC", nbins = 5, seed = 123)
+phat <- predict(xgb3, newdata = X_validation)
+rocr_pred <- prediction(phat, d_validation$Y)
+performance(rocr_pred, "auc")@y.values[[1]] 
+
+xgb4 <- xgb.train(data = dxgb_train, nthread = n_proc, objective = "binary:logistic", 
+                    nround = 200, max_depth = 10, eta = 0.1,
+                   ntrees = 200, learn_rate = 0.05, stopping_rounds=10,
+                  stopping_tolerance = 0.0001, stopping_metric="AUC", nbins = 5, seed = 123)
+phat <- predict(xgb4, newdata = X_validation)
+rocr_pred <- prediction(phat, d_validation$Y)
+performance(rocr_pred, "auc")@y.values[[1]] 
+
+```
+
+The last algorithm I used is Gradient Boosting Machine. Here I tuned two parameters, the depth of trees and the learning rate. Although GBM is robust enough to avoid overfitting with increasing trees, high learning rate can lead to overfitting. The depth of trees refers to the number of splits it has to perform on a tree (starting from a single node). So our goal is to reduce the learning rate and increase trees. According to the results, we can see the model xgb1 has the largest AUC, which means it is the best model among all others. For early stopping, it uses regularization to avoid overfitting. 
+
